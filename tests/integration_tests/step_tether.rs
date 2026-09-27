@@ -24,7 +24,7 @@ fn group_alive(pgid: i32) -> bool {
     !matches!(kill(Pid::from_raw(-pgid), None), Err(Errno::ESRCH))
 }
 
-/// Poll `cond` with a generous cap and fast interval (per tests/CLAUDE.md:
+/// Poll `cond` with a generous cap and fast interval (per tests/AGENTS.md:
 /// long timeout for slow CI, fast polling so it returns immediately when the
 /// event has happened).
 fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
@@ -134,7 +134,7 @@ fn test_tether_kills_process_group_when_command_exits(repo: TestRepo) {
 }
 
 /// The global `-C <dir>` flag runs the tethered command in that directory —
-/// the canonical way to start a server from a subdirectory (zola in `docs/`,
+/// the canonical way to start a server from a subdirectory (Astro in `docs/`,
 /// a dev server in `frontend/`) given the command runs directly with no shell
 /// to `cd`. The reaper still watches the launch cwd, not `-C`.
 #[rstest]

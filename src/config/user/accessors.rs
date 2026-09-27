@@ -229,11 +229,10 @@ impl UserConfig {
     /// Format a worktree path using this configuration's template.
     ///
     /// # Arguments
-    /// * `main_worktree` - Main worktree directory name; supplies both
-    ///   `{{ main_worktree }}` and `{{ repo }}`
+    /// * `main_worktree` - Main worktree directory name; supplies `{{ repo }}`
     /// * `branch` - Branch name (replaces {{ branch }} in template; use `{{ branch | sanitize }}` for paths)
     /// * `repo` - Repository, for template function access and for the
-    ///   `{{ repo_path }}` and `{{ owner }}` values read off it —
+    ///   `{{ repo_path }}`, `{{ owner }}`, and {{ remote_repo }} values read off it —
     ///   `{{ owner }}` is absent when the primary remote has no parseable URL
     /// * `project` - Optional project identifier (e.g., "github.com/user/repo") to look up
     ///   project-specific worktree-path template
@@ -255,15 +254,13 @@ impl UserConfig {
         // Use native path format (not POSIX) since this is used for filesystem operations
         let repo_path = repo.repo_path()?.to_string_lossy().to_string();
         let mut vars = HashMap::new();
-        vars.insert("main_worktree", main_worktree);
         vars.insert("repo", main_worktree);
         vars.insert("branch", branch);
         vars.insert("repo_path", repo_path.as_str());
-        let owner = repo
-            .primary_remote_parsed_url()
-            .map(|parsed_remote| parsed_remote.owner().to_string());
-        if let Some(ref owner) = owner {
-            vars.insert("owner", owner.as_str());
+        let parsed_remote = repo.primary_remote_parsed_url();
+        if let Some(ref parsed_remote) = parsed_remote {
+            vars.insert("owner", parsed_remote.owner());
+            vars.insert("remote_repo", parsed_remote.repo());
         }
         Ok(expand_template(
             &template,

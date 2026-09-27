@@ -179,6 +179,28 @@ fn test_get_default_branch_with_custom_remote(mut repo: TestRepo) {
     assert_eq!(branch, "main");
 }
 
+/// Git permits remote names that begin with `-`. They must remain operands in
+/// both the local remote-HEAD lookup and the fallback network query.
+#[rstest]
+fn test_get_default_branch_with_leading_dash_remote(#[from(repo_with_remote)] repo: TestRepo) {
+    repo.run_git(&["remote", "rename", "--", "origin", "-x"]);
+    let git_repo = Repository::at(repo.root_path()).unwrap();
+
+    assert_eq!(
+        git_repo.remote_head(),
+        Some(("-x".to_string(), "main".to_string()))
+    );
+
+    repo.run_git(&["update-ref", "-d", "refs/remotes/-x/HEAD"]);
+    repo.run_git(&["switch", "-c", "alpha"]);
+    repo.run_git(&["branch", "beta"]);
+    repo.run_git(&["branch", "-D", "--", "main"]);
+
+    let branch = git_repo.default_branch();
+
+    assert_eq!(branch.as_deref(), Some("main"));
+}
+
 #[rstest]
 fn test_primary_remote_detects_custom_remote(mut repo: TestRepo) {
     // Remove origin (fixture has it) so upstream becomes the primary
@@ -436,7 +458,7 @@ fn setup_insteadof(repo: &TestRepo, remote: &str, custom_url: &str, real_prefix:
     ]);
 }
 
-/// Set up push tracking so `branch.push_remote()` and `github_push_url()` work.
+/// Set up push tracking so `branch.push_remote_url()` resolves a push destination.
 fn setup_push_tracking(repo: &TestRepo, branch: &str, remote: &str) {
     repo.run_git(&["config", &format!("branch.{branch}.remote"), remote]);
     repo.run_git(&[
@@ -486,6 +508,18 @@ fn test_effective_remote_url_without_insteadof(repo: TestRepo) {
     assert_eq!(
         git_repo.remote_url("origin").unwrap(),
         git_repo.effective_remote_url("origin").unwrap()
+    );
+}
+
+/// Effective URL lookup must not parse a leading-dash remote as an option.
+#[rstest]
+fn test_effective_remote_url_with_leading_dash_remote(repo: TestRepo) {
+    repo.run_git(&["remote", "rename", "--", "origin", "-x"]);
+    let git_repo = Repository::at(repo.root_path()).unwrap();
+
+    assert_eq!(
+        git_repo.effective_remote_url("-x"),
+        git_repo.remote_url("-x")
     );
 }
 
@@ -686,7 +720,7 @@ fn test_push_remote_url_returns_non_github_url(repo: TestRepo) {
         .expect("push_remote_url resolves the configured remote regardless of host");
     let parsed = GitRemoteUrl::parse(&url).unwrap();
     assert!(!parsed.is_github());
-    assert!(parsed.is_gitlab());
+    assert_eq!(parsed.host(), "gitlab.com");
 }
 
 /// `push_remote_url`: result is cached on the Repository.
@@ -738,7 +772,7 @@ fn test_push_remote_url_insteadof_resolves_to_non_github(repo: TestRepo) {
         .push_remote_url()
         .expect("push_remote_url resolves through insteadOf regardless of host");
     let parsed = GitRemoteUrl::parse(&url).unwrap();
-    assert!(parsed.is_gitlab());
+    assert_eq!(parsed.host(), "gitlab.com");
     assert!(!parsed.is_github());
 }
 

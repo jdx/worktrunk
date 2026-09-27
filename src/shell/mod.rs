@@ -19,8 +19,7 @@ pub use detection::{
     is_shell_integration_line_for_uninstall_any_cmd, scan_for_detection_details,
 };
 pub use paths::{
-    completion_path, config_paths, home_dir_required, legacy_fish_conf_d_path,
-    line_based_config_paths, nushell_autoload_candidates,
+    fish_config_dir, home_dir_required, line_based_config_paths, nushell_autoload_candidates,
 };
 pub use utils::{
     AncestorShell, ZshStartupScope, ancestor_shell, current_shell, current_shell_name,
@@ -267,11 +266,15 @@ impl ShellInit {
                 let template = BashTemplate {
                     shell_name: self.shell.to_string(),
                     cmd: &self.cmd,
+                    cmd_ident: clap_completer_ident(&self.cmd),
                 };
                 template.render()
             }
             Shell::Zsh => {
-                let template = ZshTemplate { cmd: &self.cmd };
+                let template = ZshTemplate {
+                    cmd: &self.cmd,
+                    cmd_ident: clap_completer_ident(&self.cmd),
+                };
                 template.render()
             }
             Shell::Fish => {
@@ -300,12 +303,30 @@ impl ShellInit {
     }
 }
 
+/// Suffix of the completer function clap names its registration script after.
+///
+/// clap builds it as `<prefix><command name with '-' replaced by '_'>`
+/// (`_clap_complete_git_wt`, `_clap_dynamic_completer_git_wt`), so the lazy
+/// loader in the bash and zsh templates has to apply the same escaping to guard
+/// on and call the function the registration actually defines. The registration
+/// is emitted under this command name via `WORKTRUNK_COMPLETE_NAME`, which the
+/// templates set on the eval — see `registration_name` in `src/completion.rs`.
+///
+/// This is the one place the rule is encoded: `make_zsh_autoload_safe` in
+/// `src/commands/init.rs` rewrites the same function name in clap's zsh
+/// registration and calls here for it, so a change to clap's escaping is one
+/// edit rather than two sites that can drift apart silently.
+pub fn clap_completer_ident(cmd: &str) -> String {
+    cmd.replace('-', "_")
+}
+
 /// Bash shell template
 #[derive(Template)]
 #[template(path = "bash.sh", escape = "none")]
 struct BashTemplate<'a> {
     shell_name: String,
     cmd: &'a str,
+    cmd_ident: String,
 }
 
 /// Zsh shell template
@@ -313,6 +334,7 @@ struct BashTemplate<'a> {
 #[template(path = "zsh.zsh", escape = "none")]
 struct ZshTemplate<'a> {
     cmd: &'a str,
+    cmd_ident: String,
 }
 
 /// Fish shell template (full function for `wt config shell init fish`)

@@ -10,7 +10,6 @@
 use crate::common::{TestRepo, repo};
 use rstest::rstest;
 use std::fs;
-use worktrunk::config::UserConfig;
 
 ///
 /// When WORKTRUNK_DIRECTIVE_CD_FILE is set (shell integration active), we should:
@@ -33,12 +32,9 @@ fn test_switch_with_active_shell_integration_no_prompt(repo: TestRepo) {
     // Now switch with shell integration "active" (CD directive file set)
     // The file must exist (shell wrapper creates it before calling wt)
     let cd_file = repo.root_path().join("directive_cd.txt");
-    let exec_file = repo.root_path().join("directive_exec.txt");
     fs::write(&cd_file, "").unwrap();
-    fs::write(&exec_file, "").unwrap();
     let mut cmd = repo.wt_command();
     cmd.env("WORKTRUNK_DIRECTIVE_CD_FILE", &cd_file);
-    cmd.env("WORKTRUNK_DIRECTIVE_EXEC_FILE", &exec_file);
 
     let output = cmd.args(["switch", "feature"]).output().unwrap();
 
@@ -66,12 +62,11 @@ fn test_switch_with_active_shell_integration_no_prompt(repo: TestRepo) {
 #[rstest]
 fn test_switch_with_skip_prompt_flag(repo: TestRepo) {
     // Set the skip flag in config
-    let config_path = repo.test_config_path();
-    let config = UserConfig {
-        skip_shell_integration_prompt: true,
-        ..Default::default()
-    };
-    config.save_to(config_path).unwrap();
+    std::fs::write(
+        repo.test_config_path(),
+        "skip-shell-integration-prompt = true\n",
+    )
+    .unwrap();
 
     let output = repo
         .wt_command()
@@ -305,7 +300,9 @@ fn test_process_tree_unsupported_shell_overrides_shell_env(repo: TestRepo) {
 #[cfg(all(unix, feature = "shell-integration-tests"))]
 mod pty_tests {
     use super::*;
-    use crate::common::pty::{build_pty_command, exec_cmd_in_pty, exec_cmd_in_pty_prompted};
+    use crate::common::pty::{
+        build_pty_command, exec_cmd_in_pty, exec_cmd_in_pty_prompted, exec_cmd_in_pty_prompted_with,
+    };
     use crate::common::{add_pty_filters, setup_snapshot_settings, wt_bin};
     use insta::assert_snapshot;
     use std::path::Path;
@@ -493,6 +490,34 @@ mod pty_tests {
         });
     }
 
+    #[rstest]
+    fn test_first_run_preserves_completion_created_after_preview(repo: TestRepo) {
+        let temp_home = TempDir::new().unwrap();
+        fs::write(temp_home.path().join(".bashrc"), "# empty bashrc\n").unwrap();
+        fs::create_dir_all(temp_home.path().join(".config/fish/functions")).unwrap();
+
+        let mut env_vars = repo.test_env_vars();
+        env_vars.push(("SHELL".to_string(), "/bin/bash".to_string()));
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["switch", "--create", "feature"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home.path()),
+        );
+        let completion = temp_home.path().join(".config/fish/completions/wt.fish");
+        let callback_path = completion.clone();
+        let user_content = b"# user completion\r\n";
+
+        let (output, exit_code) = exec_cmd_in_pty_prompted_with(cmd, &["y\n"], "[y/N", move |_| {
+            fs::create_dir_all(callback_path.parent().unwrap()).unwrap();
+            fs::write(&callback_path, user_content).unwrap();
+        });
+
+        assert_eq!(exit_code, 0, "switch should still succeed:\n{output}");
+        assert_eq!(fs::read(completion).unwrap(), user_content);
+    }
+
     /// Test: User requests preview with ? then declines
     #[rstest]
     fn test_user_requests_preview_then_declines(repo: TestRepo) {
@@ -606,6 +631,10 @@ mod pty_tests {
             output.contains("Will remove") && output.contains("conf.d/wt.fish"),
             "First-run offer preview must name the legacy fish removal: {output}"
         );
+        assert!(
+            output.contains("Will create completions") && output.contains("completions/wt.fish"),
+            "First-run offer preview must name the fish completion write: {output}"
+        );
 
         // Declining leaves the legacy file in place — the preview did not delete it.
         assert!(
@@ -665,17 +694,37 @@ mod commit_generation_prompt_tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn setup_fake_claude(temp_home: &Path) -> PathBuf {
-        // Create a fake claude executable that does nothing
+    fn setup_fake_tool(temp_home: &Path, tool: &str) -> PathBuf {
+        // Create a fake LLM executable that does nothing
         let bin_dir = temp_home.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        let claude_path = bin_dir.join("claude");
-        fs::write(&claude_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let tool_path = bin_dir.join(tool);
+        fs::write(&tool_path, "#!/bin/sh\nexit 0\n").unwrap();
         // Make executable
-        let mut perms = fs::metadata(&claude_path).unwrap().permissions();
+        let mut perms = fs::metadata(&tool_path).unwrap().permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&claude_path, perms).unwrap();
+        fs::set_permissions(&tool_path, perms).unwrap();
         bin_dir
+    }
+
+    fn run_codex_prompt(repo: &TestRepo, temp_home: &Path, answers: &[&str]) -> String {
+        let bin_dir = setup_fake_tool(temp_home, "codex");
+        let test_file = repo.root_path().join("test.txt");
+        fs::write(&test_file, "test content\n").unwrap();
+        repo.run_git(&["add", "test.txt"]);
+
+        let mut env_vars = repo.test_env_vars();
+        let path = crate::common::setup_minimal_path_with_git(&bin_dir);
+        env_vars.push(("PATH".to_string(), path));
+
+        let cmd = build_pty_command(
+            wt_bin().to_str().unwrap(),
+            &["step", "commit"],
+            repo.root_path(),
+            &env_vars,
+            Some(temp_home),
+        );
+        exec_cmd_in_pty_prompted(cmd, answers, "[y/N").0
     }
 
     /// Test: No LLM tool available, prompt is skipped and skip flag is set
@@ -689,8 +738,10 @@ mod commit_generation_prompt_tests {
         repo.run_git(&["add", "test.txt"]);
 
         let mut env_vars = repo.test_env_vars();
-        // Use minimal PATH to ensure claude/codex aren't found
-        env_vars.push(("PATH".to_string(), "/usr/bin:/bin".to_string()));
+        // Use minimal PATH to ensure claude/codex aren't found while retaining
+        // the supported Git selected by the test runner.
+        let path = crate::common::setup_minimal_path_with_git(&temp_home.path().join("bin"));
+        env_vars.push(("PATH".to_string(), path));
 
         let cmd = build_pty_command(
             wt_bin().to_str().unwrap(),
@@ -716,7 +767,7 @@ mod commit_generation_prompt_tests {
     #[rstest]
     fn test_user_declines_llm_prompt(repo: TestRepo) {
         let temp_home = TempDir::new().unwrap();
-        let bin_dir = setup_fake_claude(temp_home.path());
+        let bin_dir = setup_fake_tool(temp_home.path(), "claude");
 
         // Stage a change
         let test_file = repo.root_path().join("test.txt");
@@ -725,7 +776,7 @@ mod commit_generation_prompt_tests {
 
         let mut env_vars = repo.test_env_vars();
         // Add our fake claude to PATH
-        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let path = crate::common::setup_minimal_path_with_git(&bin_dir);
         env_vars.push(("PATH".to_string(), path));
 
         let cmd = build_pty_command(
@@ -757,7 +808,7 @@ mod commit_generation_prompt_tests {
     #[rstest]
     fn test_user_accepts_llm_prompt(repo: TestRepo) {
         let temp_home = TempDir::new().unwrap();
-        let bin_dir = setup_fake_claude(temp_home.path());
+        let bin_dir = setup_fake_tool(temp_home.path(), "claude");
 
         // Stage a change
         let test_file = repo.root_path().join("test.txt");
@@ -765,7 +816,7 @@ mod commit_generation_prompt_tests {
         repo.run_git(&["add", "test.txt"]);
 
         let mut env_vars = repo.test_env_vars();
-        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let path = crate::common::setup_minimal_path_with_git(&bin_dir);
         env_vars.push(("PATH".to_string(), path));
 
         let cmd = build_pty_command(
@@ -794,11 +845,94 @@ mod commit_generation_prompt_tests {
         );
     }
 
+    #[rstest]
+    fn test_user_accepts_codex_prompt(repo: TestRepo) {
+        let temp_home = TempDir::new().unwrap();
+        let output = run_codex_prompt(&repo, temp_home.path(), &["y\n"]);
+
+        assert!(output.contains("Added to user config"), "{output}");
+        assert!(output.contains("Created Codex instructions"), "{output}");
+        assert!(
+            output.contains("the saved Codex command requires it"),
+            "{output}"
+        );
+        let config_content = fs::read_to_string(repo.test_config_path()).unwrap();
+        assert!(config_content.contains("model_instructions_file"));
+        assert_eq!(
+            fs::read(
+                temp_home
+                    .path()
+                    .join(".codex/worktrunk-commit-instructions.txt")
+            )
+            .unwrap(),
+            b"."
+        );
+    }
+
+    #[rstest]
+    fn test_codex_preview_then_decline_does_not_create_instructions(repo: TestRepo) {
+        let temp_home = TempDir::new().unwrap();
+        let output = run_codex_prompt(&repo, temp_home.path(), &["?\n", "n\n"]);
+
+        assert!(
+            output.contains("creates a one-character file there if absent"),
+            "{output}"
+        );
+        assert!(
+            !temp_home
+                .path()
+                .join(".codex/worktrunk-commit-instructions.txt")
+                .exists()
+        );
+        let config_content = fs::read_to_string(repo.test_config_path()).unwrap_or_default();
+        assert!(!config_content.contains("model_instructions_file"));
+    }
+
+    #[rstest]
+    fn test_codex_prompt_reuses_existing_instructions(repo: TestRepo) {
+        let temp_home = TempDir::new().unwrap();
+        let instructions = temp_home
+            .path()
+            .join(".codex/worktrunk-commit-instructions.txt");
+        fs::create_dir_all(instructions.parent().unwrap()).unwrap();
+        fs::write(&instructions, "Existing instructions").unwrap();
+
+        let output = run_codex_prompt(&repo, temp_home.path(), &["y\n"]);
+
+        assert!(!output.contains("Created Codex instructions"), "{output}");
+        assert!(
+            output.contains("the saved Codex command requires it"),
+            "{output}"
+        );
+        assert_eq!(
+            fs::read_to_string(&instructions).unwrap(),
+            "Existing instructions"
+        );
+        let config_content = fs::read_to_string(repo.test_config_path()).unwrap();
+        assert!(config_content.contains("model_instructions_file"));
+    }
+
+    #[rstest]
+    fn test_codex_prompt_file_creation_failure_does_not_save_command(repo: TestRepo) {
+        let temp_home = TempDir::new().unwrap();
+        fs::write(temp_home.path().join(".codex"), "not a directory").unwrap();
+
+        let output = run_codex_prompt(&repo, temp_home.path(), &["y\n"]);
+
+        assert!(
+            output.contains("Codex setup failed: Failed to create"),
+            "{output}"
+        );
+        assert!(output.contains(".codex"), "{output}");
+        let config_content = fs::read_to_string(repo.test_config_path()).unwrap_or_default();
+        assert!(!config_content.contains("model_instructions_file"));
+    }
+
     /// Test: User requests preview (?)
     #[rstest]
     fn test_user_requests_preview(repo: TestRepo) {
         let temp_home = TempDir::new().unwrap();
-        let bin_dir = setup_fake_claude(temp_home.path());
+        let bin_dir = setup_fake_tool(temp_home.path(), "claude");
 
         // Stage a change
         let test_file = repo.root_path().join("test.txt");
@@ -806,7 +940,7 @@ mod commit_generation_prompt_tests {
         repo.run_git(&["add", "test.txt"]);
 
         let mut env_vars = repo.test_env_vars();
-        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let path = crate::common::setup_minimal_path_with_git(&bin_dir);
         env_vars.push(("PATH".to_string(), path));
 
         let cmd = build_pty_command(
@@ -836,7 +970,7 @@ mod commit_generation_prompt_tests {
     #[rstest]
     fn test_user_accepts_but_save_fails_shows_manual_hint(repo: TestRepo) {
         let temp_home = TempDir::new().unwrap();
-        let bin_dir = setup_fake_claude(temp_home.path());
+        let bin_dir = setup_fake_tool(temp_home.path(), "claude");
 
         // Stage a change
         let test_file = repo.root_path().join("test.txt");
@@ -850,7 +984,7 @@ mod commit_generation_prompt_tests {
         let unwritable_config = blocker.join("config.toml");
 
         let mut env_vars = repo.test_env_vars();
-        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let path = crate::common::setup_minimal_path_with_git(&bin_dir);
         env_vars.push(("PATH".to_string(), path));
         // Overrides the WORKTRUNK_CONFIG_PATH from test_env_vars (last wins).
         env_vars.push((

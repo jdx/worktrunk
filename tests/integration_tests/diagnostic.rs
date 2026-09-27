@@ -1,20 +1,16 @@
-//! Tests for diagnostic report generation.
+//! Tests for what `-v` and `-vv` produce.
 //!
-//! These tests verify the markdown structure and content of diagnostic reports
-//! to ensure they're suitable for GitHub issue filing.
+//! The diagnostic bundle is what a reporter pastes into a gist, so its tests
+//! pin the markdown structure, the sections it must carry, the pointer and
+//! gist hints `-vv` prints, and that the captured context is ANSI-free and
+//! free of raw control bytes. The rest cover the surrounding verbosity
+//! machinery: which files each level writes under `.git/wt/logs/`, how
+//! `trace.log`, `trace.jsonl` and `subprocess.log` divide the bounded preview
+//! from the full body and join back to each other, and how `RUST_LOG` and
+//! `WORKTRUNK_VERBOSE` combine with the flag.
 //!
-//! # Test Coverage
-//!
-//! - `test_diagnostic_report_file_format`: Snapshot of full diagnostic structure
-//! - `test_diagnostic_not_created_without_vv`: No file without -vv
-//! - `test_diagnostic_hint_without_vv`: Hint tells user to use -vv
-//! - `test_diagnostic_contains_required_sections`: All sections present
-//! - `test_diagnostic_context_has_no_ansi_codes`: ANSI stripped for GitHub
-//! - `test_diagnostic_trace_log_contains_git_commands`: Log has useful data
-//! - `test_diagnostic_saved_message_with_vv`: -vv announces the saved report
-//! - `test_diagnostic_leads_with_profile`: Profile is the bundle's first section
-//! - `test_diagnostic_written_to_correct_location`: File in .git/wt/logs/
-//! - `test_diagnostic_gh_hint_with_vv`: Hint shows gist and issue URL when gh installed
+//! Each test carries its own docstring; an inventory of them here goes stale
+//! as tests are added, so there isn't one.
 
 use std::fs;
 use std::path::PathBuf;
@@ -426,6 +422,52 @@ fn test_diagnostic_leads_with_profile(repo: TestRepo) {
     assert!(
         stderr.contains("Diagnostics and performance profile saved"),
         "stderr should announce the diagnostic bundle. stderr: {stderr}"
+    );
+}
+
+/// The subprocesses that assemble a `-vv` report stay visible in the raw trace
+/// but do not change any aggregate in the profile read back from that trace.
+#[rstest]
+fn test_profile_excludes_diagnostic_collector(repo: TestRepo) {
+    let output = repo.wt_command().args(["list", "-vv"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "wt list -vv should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let logs_dir = repo.root_path().join(".git/wt/logs");
+    let trace_jsonl = fs::read_to_string(logs_dir.join("trace.jsonl")).unwrap();
+    let entries = worktrunk::trace::parse_lines(&trace_jsonl);
+    let diagnostic_context = worktrunk::trace::emit::DIAGNOSTIC_CONTEXT;
+    let profiled_entries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.context.as_deref() != Some(diagnostic_context))
+        .cloned()
+        .collect();
+
+    assert!(
+        entries.iter().any(|entry| {
+            entry.context.as_deref() == Some(diagnostic_context)
+                && matches!(
+                    &entry.kind,
+                    worktrunk::trace::TraceEntryKind::Command { command, .. }
+                        if command == "git worktree list --porcelain"
+                )
+        }),
+        "the diagnostic collector should mark its worktree-list record:\n{trace_jsonl}"
+    );
+    assert_eq!(
+        worktrunk::trace::Profile::from_entries(&entries),
+        worktrunk::trace::Profile::from_entries(&profiled_entries)
+    );
+
+    let trace_log = fs::read_to_string(logs_dir.join("trace.log")).unwrap();
+    assert!(
+        trace_log
+            .lines()
+            .any(|line| line.contains("$ git worktree list --porcelain [(diagnostic)]")),
+        "the collector's command start and completion should share a context:\n{trace_log}"
     );
 }
 

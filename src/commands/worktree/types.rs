@@ -33,12 +33,6 @@ pub enum SwitchResult {
         base_worktree_path: Option<String>,
         /// Remote tracking branch if auto-created from remote (e.g., "origin/feature")
         from_remote: Option<String>,
-        /// PR/MR number when created via `pr:N` / `mr:N` (carried into post-* hook
-        /// templates as `pr_number`).
-        pr_number: Option<u32>,
-        /// PR/MR web URL when created via `pr:N` / `mr:N` (carried into post-* hook
-        /// templates as `pr_url`).
-        pr_url: Option<String>,
     },
 }
 
@@ -72,11 +66,11 @@ pub enum CreationMethod {
         /// When `--base pr:N` / `--base mr:N` (same-repo) is paired with `--create`,
         /// the user's intent is "create a new branch tracking the PR/MR's source
         /// branch on the remote", so `git push` from the new worktree pushes back
-        /// to that PR/MR. `git worktree add -b new <bare-name>` doesn't set up
-        /// tracking on its own (only `<remote>/<branch>` triggers DWIM, and even
-        /// then we'd unset it via the issue-#713 safety check), so we capture the
-        /// (remote, branch) pair here and configure tracking explicitly after
-        /// `git worktree add` succeeds. `None` for any other base resolution.
+        /// to that PR/MR. That branch may carry any name, and
+        /// `branch.autoSetupMerge = simple` sets an upstream only where the new
+        /// branch shares it, so we capture the (remote, branch) pair here and
+        /// configure tracking explicitly after `git worktree add` succeeds.
+        /// `None` for any other base resolution.
         base_pr_upstream: Option<(String, String)>,
     },
     /// Fork PR/MR: fetch from refs/pull/N/head or refs/merge-requests/N/head,
@@ -94,11 +88,26 @@ pub enum CreationMethod {
         /// URL to push to (the fork's URL). `None` when using a prefixed branch
         /// name (e.g., `contributor/main`) because push won't work.
         fork_push_url: Option<String>,
-        /// Web URL for the PR/MR.
-        ref_url: String,
         /// Resolved remote name where PR/MR refs live (e.g., "origin", "upstream").
         remote: String,
     },
+}
+
+/// Identity of the PR/MR a `pr:N` / `mr:N` argument resolved to.
+///
+/// Resolved once, before `pre-switch` hooks run, then held by whoever needs it:
+/// the `ResolvedTarget` `pre-switch` reads, the plan `pre-start` reads, and the
+/// pipeline's own clone behind the post-* hooks — an `Existing` switch builds no
+/// `SwitchPlan::Create` at all. So `pr_number` / `pr_url` reach every switch
+/// hook whether the PR came from this repo or a fork. Reading it back off
+/// [`CreationMethod::ForkRef`] used to be the only source, which silently left
+/// same-repo PRs (the common case) with both variables unset.
+#[derive(Debug, Clone)]
+pub struct RefIdentity {
+    /// The PR/MR number the user typed.
+    pub number: u32,
+    /// Web URL of the PR/MR.
+    pub url: String,
 }
 
 /// Validated plan for a switch operation.
@@ -122,6 +131,10 @@ pub enum SwitchPlan {
         worktree_path: PathBuf,
         /// How to create the worktree
         method: CreationMethod,
+        /// The PR/MR this switch resolved from, when the argument was
+        /// `pr:N` / `mr:N`. Source of the `pr_number` / `pr_url` hook
+        /// variables.
+        ref_identity: Option<RefIdentity>,
         /// True when a stale path occupies `worktree_path` and `--clobber` was
         /// given — `execute_switch` backs it up before creating the worktree.
         needs_clobber_backup: bool,
@@ -183,8 +196,8 @@ impl SharedBranchCheckout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchFate {
     /// No deletion was attempted: the plan had no branch (detached worktree)
-    /// or retained it (`deletion_mode` Keep — shared checkout, or
-    /// `--no-delete-branch`).
+    /// or retained it (`deletion_mode` Keep — a shared checkout, an unborn
+    /// branch with no ref to delete, or `--no-delete-branch`).
     NotAttempted,
     /// The deletion ran and the branch is gone.
     Deleted,
@@ -312,19 +325,19 @@ pub enum RemovalPlan {
         /// [`SharedBranchCheckout`].
         branch_checked_out_at: Option<SharedBranchCheckout>,
     },
-    /// Branch exists but has no worktree directory - attempt branch deletion
+    /// Branch exists but has no usable worktree - attempt branch deletion
     /// only, unregistering the stale worktree entry first when one remains.
     BranchOnly {
         branch_name: String,
         deletion_mode: BranchDeletionMode,
         /// Stale worktree entry to unregister, recorded when the plan fell
-        /// back from a worktree whose directory was missing. Planning never
-        /// mutates — execution performs the prune (`git worktree remove`,
-        /// which validates before touching anything, so a directory that
-        /// reappears at this path between planning and execution is handled
-        /// by git: a clean reconnected worktree is removed, a dirty or
-        /// foreign one refuses loudly). `None` when the branch has no
-        /// worktree entry at all.
+        /// back from a prunable worktree. Planning never mutates — execution
+        /// performs the prune
+        /// ([`prune_worktree_entry`](worktrunk::git::Repository::prune_worktree_entry)),
+        /// which repeats git's prune test first, so a worktree reconnected at
+        /// this path between planning and execution refuses rather than
+        /// losing its registration. Whatever remains of the directory stays.
+        /// `None` when the branch has no worktree entry at all.
         prune_entry: Option<PathBuf>,
         /// Integration target for display. May be the effective target (e.g.,
         /// `origin/main` when upstream is ahead) or the local default branch.
@@ -334,9 +347,9 @@ pub enum RemovalPlan {
         /// executor still rechecks topology and ref state before safe deletion.
         integration_reason: Option<worktrunk::git::IntegrationReason>,
         /// A surviving checkout of `branch_name`, when one exists. Only reachable
-        /// on a pruned removal — the target's directory was gone, but a sibling
-        /// checkout of the same branch survives the fallback to branch-only
-        /// deletion. See [`SharedBranchCheckout`].
+        /// on a pruned removal — the target was stale, but a sibling checkout
+        /// of the same branch survives the fallback to branch-only deletion.
+        /// See [`SharedBranchCheckout`].
         branch_checked_out_at: Option<SharedBranchCheckout>,
         /// A detached worktree occupying the directory `branch_name`'s worktree
         /// would use, when one is there.
@@ -607,8 +620,6 @@ mod tests {
                     base_branch: Some("main".to_string()),
                     base_worktree_path: Some("/test/main".to_string()),
                     from_remote: None,
-                    pr_number: None,
-                    pr_url: None,
                 },
                 PathBuf::from("/test/created"),
             ),
@@ -620,8 +631,6 @@ mod tests {
                     base_branch: None,
                     base_worktree_path: None,
                     from_remote: Some("origin/feature".to_string()),
-                    pr_number: None,
-                    pr_url: None,
                 },
                 PathBuf::from("/test/remote"),
             ),

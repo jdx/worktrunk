@@ -69,6 +69,7 @@
 //! must remain files. If a future category needs multiple files, it should live
 //! under a single reserved subdirectory rather than adding sibling top-level dirs.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -76,8 +77,8 @@ use crate::commands::picker::preview_cache;
 use anyhow::Context;
 use color_print::cformat;
 use path_slash::PathExt as _;
-use worktrunk::git::{BranchRef, Repository, resolve_input_path, sha_cache};
-use worktrunk::path::format_path_for_display;
+use worktrunk::git::{BranchRef, CommandError, Repository, resolve_input_path, sha_cache};
+use worktrunk::path::{format_path_for_display, sanitize_for_filename};
 use worktrunk::styling::{
     eprintln, format_heading, format_with_gutter, hint_message, info_message, println,
     success_message, warning_message,
@@ -360,11 +361,12 @@ struct LogRow {
 
 /// Structured view of a hook-output log path. Values are the on-disk (sanitized)
 /// names, so filters like `select(.source == "user")` work without splitting
-/// the relative path on `/`.
+/// the relative path on `/`. The JSON `branch` field is the exception: it maps
+/// `branch_dir` back to the branch name (see [`branch_by_log_dir`]).
 struct HookStructure {
     /// First path segment — sanitized branch directory (may include a short
     /// collision-avoidance hash).
-    branch: String,
+    branch_dir: String,
     /// `"user"`, `"project"`, or `"internal"`.
     source: String,
     /// Hook type (`post-start`, `post-switch`, …) for user/project hooks;
@@ -377,15 +379,22 @@ struct HookStructure {
 
 impl LogRow {
     fn to_json(&self) -> serde_json::Value {
-        let mut obj = serde_json::json!({
+        serde_json::json!({
             "file": self.display_name,
             "path": self.path,
             "size": self.size,
             "modified_at": self.modified_at,
-        });
+        })
+    }
+
+    /// JSON for a hook-output row: the base fields plus the structured
+    /// segments, with `branch` resolved through `branch_by_dir`.
+    fn to_hook_json(&self, branch_by_dir: &HashMap<String, Option<String>>) -> serde_json::Value {
+        let mut obj = self.to_json();
         if let Some(s) = &self.hook_structure {
             let map = obj.as_object_mut().expect("json! produced an object");
-            map.insert("branch".into(), s.branch.clone().into());
+            let branch = branch_by_dir.get(&s.branch_dir).cloned().flatten();
+            map.insert("branch".into(), branch.into());
             map.insert("source".into(), s.source.clone().into());
             map.insert(
                 "hook_type".into(),
@@ -451,14 +460,14 @@ fn hook_output_log_row(log_dir: &Path, entry: &HookOutputEntry) -> LogRow {
 fn parse_hook_structure(relative: &str) -> Option<HookStructure> {
     let parts: Vec<&str> = relative.split('/').collect();
     match parts.as_slice() {
-        [branch, "internal", op_log] => Some(HookStructure {
-            branch: (*branch).to_string(),
+        [branch_dir, "internal", op_log] => Some(HookStructure {
+            branch_dir: (*branch_dir).to_string(),
             source: "internal".to_string(),
             hook_type: None,
             name: op_log.strip_suffix(".log").unwrap_or(op_log).to_string(),
         }),
-        [branch, source, hook_type, name_log] => Some(HookStructure {
-            branch: (*branch).to_string(),
+        [branch_dir, source, hook_type, name_log] => Some(HookStructure {
+            branch_dir: (*branch_dir).to_string(),
             source: (*source).to_string(),
             hook_type: Some((*hook_type).to_string()),
             name: name_log
@@ -509,12 +518,34 @@ fn partition_log_files_json(
         .iter()
         .map(|e| hook_output_log_row(&log_dir, e))
         .collect();
+    let branch_by_dir = branch_by_log_dir(repo)?;
 
     Ok((
         cmd_rows.iter().map(LogRow::to_json).collect(),
-        hook_rows.iter().map(LogRow::to_json).collect(),
+        hook_rows
+            .iter()
+            .map(|r| r.to_hook_json(&branch_by_dir))
+            .collect(),
         diagnostic_rows.iter().map(LogRow::to_json).collect(),
     ))
+}
+
+/// Map each hook-log branch directory back to the local branch that writes it.
+///
+/// A branch's logs live under `sanitize_for_filename(branch)`, which appends a
+/// one-way hash to names that aren't filename-safe (`feature/x` →
+/// `feature-x-<hash>`), so the directory alone can't recover the name.
+/// Sanitizing every local branch inverts it for the branches that still exist.
+/// A directory two branches share maps to `None`, as does (by absence) one
+/// whose branch was deleted, so `branch` in JSON is either exact or `null`.
+fn branch_by_log_dir(repo: &Repository) -> anyhow::Result<HashMap<String, Option<String>>> {
+    let mut map = HashMap::new();
+    for branch in repo.local_branches()? {
+        map.entry(sanitize_for_filename(&branch.name))
+            .and_modify(|b| *b = None)
+            .or_insert_with(|| Some(branch.name.clone()));
+    }
+    Ok(map)
 }
 
 /// Sort log rows by mtime (newest first), stable on display name.
@@ -713,7 +744,7 @@ pub fn handle_state_get(
         "default-branch" => {
             let branch_name = repo.default_branch().ok_or_else(|| {
                 anyhow::anyhow!(cformat!(
-                    "Cannot determine default branch. To configure, run <bold>wt config state default-branch set BRANCH</>"
+                    "Cannot determine default branch; to configure one, run <bold>wt config state default-branch set BRANCH</>"
                 ))
             })?;
             println!("{branch_name}");
@@ -834,9 +865,39 @@ pub fn handle_state_get(
     Ok(())
 }
 
+/// True when `err` is `Repository::current()` failing with the exit 128 that
+/// `git rev-parse --git-common-dir` returns when the discovery path has no
+/// usable git repository. That covers the missing-repo case the marker hooks
+/// hit, and equally an unreadable or corrupt `.git`, which git reports the
+/// same way and which no-ops just as harmlessly for a marker. Any other exit
+/// code still propagates, so the #3921 fallback stays off unrelated failures.
+///
+/// The exit code is the whole check on purpose. git translates
+/// `not a git repository`, and the translation ships in the distro package,
+/// so matching that text would leave every non-English user on the old
+/// behavior with nothing in the suite able to catch it.
+fn is_missing_repository_error(err: &anyhow::Error) -> bool {
+    CommandError::find_in(err).is_some_and(|cmd_err| cmd_err.exit_code == Some(128))
+}
+
 /// Handle the state set command
 pub fn handle_state_set(key: &str, value: String, branch: Option<String>) -> anyhow::Result<()> {
-    let repo = Repository::current()?;
+    let repo = match Repository::current() {
+        Ok(repo) => repo,
+        Err(err) if key == "marker" && is_missing_repository_error(&err) => {
+            // The Claude Code / Codex / Gemini marker hooks call `marker set`
+            // unconditionally on every turn (`UserPromptSubmit`, `Stop`, …),
+            // regardless of whether the session's directory is inside a git
+            // repository. Before this, a session started outside a repo made
+            // every one of those calls print `git rev-parse --git-common-dir
+            // failed (exit 128)` to stderr and exit 1 — silently discarded by
+            // the hook's own `|| true`, but still a spurious failure on every
+            // turn. Treat "no repository here" as the no-op it already
+            // behaves like from the hook's perspective (#3921).
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     match key {
         "default-branch" => {
@@ -893,7 +954,15 @@ pub fn handle_state_set(key: &str, value: String, branch: Option<String>) -> any
 
 /// Handle the state clear command
 pub fn handle_state_clear(key: &str, branch: Option<String>, all: bool) -> anyhow::Result<()> {
-    let repo = Repository::current()?;
+    let repo = match Repository::current() {
+        Ok(repo) => repo,
+        Err(err) if key == "marker" && is_missing_repository_error(&err) => {
+            // `SessionEnd` fires the same unconditional `marker clear` call —
+            // see the matching comment in `handle_state_set`.
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     match key {
         "default-branch" => {
@@ -1080,51 +1149,42 @@ fn clear_previous_branch_reported(repo: &Repository) -> anyhow::Result<bool> {
     Ok(false)
 }
 
-fn clear_markers_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = clear_all_markers(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> marker{}",
-                if cleared == 1 { "" } else { "s" }
-            ))
-        );
-        return Ok(true);
+fn report_cleared_count(cleared: usize, singular: &str, plural: &str) -> bool {
+    if cleared == 0 {
+        return false;
     }
-    Ok(false)
+    let noun = if cleared == 1 { singular } else { plural };
+    eprintln!(
+        "{}",
+        success_message(cformat!("Cleared <bold>{cleared}</> {noun}"))
+    );
+    true
+}
+
+fn clear_markers_reported(repo: &Repository) -> anyhow::Result<bool> {
+    Ok(report_cleared_count(
+        clear_all_markers(repo)?,
+        "marker",
+        "markers",
+    ))
 }
 
 fn clear_ci_status_reported(repo: &Repository) -> anyhow::Result<bool> {
     // The PR-number width ratchet is part of the CI cache category — it is
     // derived from the same fetches and re-learns on the next one.
-    let cleared = CachedCiStatus::clear_all(repo)? + MaxPrNumber::clear(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> CI cache entr{}",
-                if cleared == 1 { "y" } else { "ies" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        CachedCiStatus::clear_all(repo)? + MaxPrNumber::clear(repo)?,
+        "CI cache entry",
+        "CI cache entries",
+    ))
 }
 
 fn clear_summary_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = CachedSummary::clear_all(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> summary cache entr{}",
-                if cleared == 1 { "y" } else { "ies" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        CachedSummary::clear_all(repo)?,
+        "summary cache entry",
+        "summary cache entries",
+    ))
 }
 
 /// Clear all SHA-keyed git command caches: parsed results (merge-tree,
@@ -1132,78 +1192,43 @@ fn clear_summary_reported(repo: &Repository) -> anyhow::Result<bool> {
 /// upstream-diff). Surfaced as one user-facing category — see the parity
 /// docstring at the top of this file.
 fn clear_git_commands_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = sha_cache::clear_all(repo)? + preview_cache::clear_all(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> git commands cache entr{}",
-                if cleared == 1 { "y" } else { "ies" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        sha_cache::clear_all(repo)? + preview_cache::clear_all(repo)?,
+        "git commands cache entry",
+        "git commands cache entries",
+    ))
 }
 
 fn clear_vars_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = clear_all_vars(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> variable{}",
-                if cleared == 1 { "" } else { "s" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        clear_all_vars(repo)?,
+        "variable",
+        "variables",
+    ))
 }
 
 fn clear_logs_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = clear_logs(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> log file{}",
-                if cleared == 1 { "" } else { "s" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        clear_logs(repo)?,
+        "log file",
+        "log files",
+    ))
 }
 
 fn clear_hints_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = repo.clear_all_hints()?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> hint{}",
-                if cleared == 1 { "" } else { "s" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        repo.clear_all_hints()?,
+        "hint",
+        "hints",
+    ))
 }
 
 fn clear_trash_reported(repo: &Repository) -> anyhow::Result<bool> {
-    let cleared = clear_trash(repo)?;
-    if cleared > 0 {
-        eprintln!(
-            "{}",
-            success_message(cformat!(
-                "Cleared <bold>{cleared}</> trash entr{}",
-                if cleared == 1 { "y" } else { "ies" }
-            ))
-        );
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(report_cleared_count(
+        clear_trash(repo)?,
+        "trash entry",
+        "trash entries",
+    ))
 }
 
 // ==================== State Show Commands ====================
@@ -1719,49 +1744,50 @@ pub fn handle_vars_clear(
         None => repo.require_current_branch("clear variable for current branch")?,
     };
 
-    if !all && key.is_none() {
-        anyhow::bail!("Specify a key to clear, or use --all to clear all keys");
-    }
-
-    if all {
-        let entries: Vec<_> = repo.vars_entries(&branch_name).into_iter().collect();
-        if entries.is_empty() {
-            eprintln!(
-                "{}",
-                info_message(cformat!("No variables for <bold>{branch_name}</>"))
-            );
-        } else {
-            let count = entries.len();
-            for (key, _) in entries {
-                let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
-                repo.unset_config(&config_key)?;
-            }
-            eprintln!(
-                "{}",
-                success_message(cformat!(
-                    "Cleared <bold>{count}</> variable{} for <bold>{branch_name}</>",
-                    if count == 1 { "" } else { "s" }
-                ))
-            );
+    match (all, key) {
+        (false, None) => {
+            anyhow::bail!("Specify a key to clear, or use --all to clear all keys");
         }
-    } else {
-        let key = key.expect("key required when --all not set");
-        validate_vars_key(key)?;
-        let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
-        if repo.unset_config(&config_key)? {
-            eprintln!(
-                "{}",
-                success_message(cformat!(
-                    "Cleared <bold>{key}</> for <bold>{branch_name}</>"
-                ))
-            );
-        } else {
-            eprintln!(
-                "{}",
-                info_message(cformat!(
-                    "No variable <bold>{key}</> for <bold>{branch_name}</>"
-                ))
-            );
+        (true, _) => {
+            let entries: Vec<_> = repo.vars_entries(&branch_name).into_iter().collect();
+            if entries.is_empty() {
+                eprintln!(
+                    "{}",
+                    info_message(cformat!("No variables for <bold>{branch_name}</>"))
+                );
+            } else {
+                let count = entries.len();
+                for (key, _) in entries {
+                    let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
+                    repo.unset_config(&config_key)?;
+                }
+                eprintln!(
+                    "{}",
+                    success_message(cformat!(
+                        "Cleared <bold>{count}</> variable{} for <bold>{branch_name}</>",
+                        if count == 1 { "" } else { "s" }
+                    ))
+                );
+            }
+        }
+        (false, Some(key)) => {
+            validate_vars_key(key)?;
+            let config_key = format!("worktrunk.state.{branch_name}.vars.{key}");
+            if repo.unset_config(&config_key)? {
+                eprintln!(
+                    "{}",
+                    success_message(cformat!(
+                        "Cleared <bold>{key}</> for <bold>{branch_name}</>"
+                    ))
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    info_message(cformat!(
+                        "No variable <bold>{key}</> for <bold>{branch_name}</>"
+                    ))
+                );
+            }
         }
     }
     Ok(())
@@ -1775,7 +1801,11 @@ pub fn handle_vars_clear(
 /// `unset_config` call propagate errors so user-initiated clears never lie
 /// about success.
 fn clear_all_markers(repo: &Repository) -> anyhow::Result<usize> {
-    let output = repo.get_config_regexp(r"^worktrunk\.state\..+\.marker$")?;
+    clear_matching_config(repo, r"^worktrunk\.state\..+\.marker$")
+}
+
+fn clear_matching_config(repo: &Repository, pattern: &str) -> anyhow::Result<usize> {
+    let output = repo.get_config_regexp(pattern)?;
     let mut cleared = 0;
     for line in output.lines() {
         if let Some(config_key) = line.split_whitespace().next() {
@@ -1792,15 +1822,7 @@ fn clear_all_markers(repo: &Repository) -> anyhow::Result<usize> {
 /// config read failure surfaces as an error — the display-path helper
 /// absorbs errors as empty, which would silently report "cleared 0" here.
 fn clear_all_vars(repo: &Repository) -> anyhow::Result<usize> {
-    let output = repo.get_config_regexp(r"^worktrunk\.state\..+\.vars\.")?;
-    let mut cleared = 0;
-    for line in output.lines() {
-        if let Some(config_key) = line.split_whitespace().next() {
-            repo.unset_config(config_key)?;
-            cleared += 1;
-        }
-    }
-    Ok(cleared)
+    clear_matching_config(repo, r"^worktrunk\.state\..+\.vars\.")
 }
 
 // ==================== Marker Helpers ====================

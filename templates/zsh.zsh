@@ -6,8 +6,7 @@
 # Only initialize if {{ cmd }} is available (in PATH or via WORKTRUNK_BIN)
 if command -v {{ cmd }} >/dev/null 2>&1 || [[ -n "${WORKTRUNK_BIN:-}" ]]; then
 
-    # Override {{ cmd }} command with split directive passing.
-    # Creates two temp files: one for cd (raw path) and one for exec (shell).
+    # Override {{ cmd }} command so it can change the parent shell's directory.
     # WORKTRUNK_BIN can override the binary path (for testing dev builds).
     {{ cmd }}() {
         local use_source=false
@@ -25,16 +24,15 @@ if command -v {{ cmd }} >/dev/null 2>&1 || [[ -n "${WORKTRUNK_BIN:-}" ]]; then
             return
         fi
 
-        local cd_file exec_file exit_code=0
+        local cd_file exit_code=0
         cd_file="$(mktemp)"
-        exec_file="$(mktemp)"
 
         # --source: use cargo run (builds from source)
         if [[ "$use_source" == true ]]; then
-            WORKTRUNK_DIRECTIVE_CD_FILE="$cd_file" WORKTRUNK_DIRECTIVE_EXEC_FILE="$exec_file" \
+            WORKTRUNK_DIRECTIVE_CD_FILE="$cd_file" \
                 cargo run --bin {{ cmd }} --quiet -- "${args[@]}" || exit_code=$?
         else
-            WORKTRUNK_DIRECTIVE_CD_FILE="$cd_file" WORKTRUNK_DIRECTIVE_EXEC_FILE="$exec_file" \
+            WORKTRUNK_DIRECTIVE_CD_FILE="$cd_file" \
                 command "${WORKTRUNK_BIN:-{{ cmd }}}" "${args[@]}" || exit_code=$?
         fi
 
@@ -50,29 +48,23 @@ if command -v {{ cmd }} >/dev/null 2>&1 || [[ -n "${WORKTRUNK_BIN:-}" ]]; then
             fi
         fi
 
-        # exec file holds arbitrary shell (e.g. from --execute)
-        if [[ -s "$exec_file" ]]; then
-            source "$exec_file"
-            local src_exit=$?
-            if [[ $exit_code -eq 0 ]]; then
-                exit_code=$src_exit
-            fi
-        fi
-
-        command rm -f "$cd_file" "$exec_file"
+        command rm -f "$cd_file"
         return "$exit_code"
     }
 
     # Lazy completions - generate on first TAB, then delegate to clap's completer
     _{{ cmd }}_lazy_complete() {
         # Generate completions function once (check if clap's function exists)
-        if ! (( $+functions[_clap_dynamic_completer_{{ cmd }}] )); then
+        if ! (( $+functions[_clap_dynamic_completer_{{ cmd_ident }}] )); then
             # Use `command` to bypass the shell function and call the binary directly.
             # Without this, `{{ cmd }}` would call the shell function which evals
             # the completion script internally but doesn't re-emit it.
-            eval "$(COMPLETE=zsh command "${WORKTRUNK_BIN:-{{ cmd }}}" 2>/dev/null)" || return
+            # WORKTRUNK_COMPLETE_NAME emits the registration under the name bound
+            # below; clap would otherwise name everything after its own command
+            # name and the call below would hit an undefined function (#3816).
+            eval "$(WORKTRUNK_COMPLETE_NAME="{{ cmd }}" COMPLETE=zsh command "${WORKTRUNK_BIN:-{{ cmd }}}" 2>/dev/null)" || return
         fi
-        _clap_dynamic_completer_{{ cmd }} "$@"
+        _clap_dynamic_completer_{{ cmd_ident }} "$@"
     }
 
     # Register completion (silently skip if compinit hasn't run yet).

@@ -1,6 +1,29 @@
 use std::path::PathBuf;
 
-use super::super::{DefaultBranchName, WorktreeInfo, finalize_worktree};
+use super::super::{DefaultBranchName, WorktreeInfo, finalize_worktrees};
+use crate::git::Repository;
+use crate::testing::TestRepo;
+
+#[cfg(unix)]
+#[test]
+fn alternate_object_directory_uses_git_c_style_quoting() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let path = OsStr::from_bytes(b"a:b\n\r\t\x08\x0c\\\"\x01\xff");
+    let quoted = super::quote_alternate_object_directory(path);
+    assert_eq!(
+        quoted.into_vec(),
+        b"\"a:b\\n\\r\\t\\b\\f\\\\\\\"\\001\\377\""
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn alternate_object_directory_uses_git_c_style_quoting() {
+    let quoted = super::quote_alternate_object_directory(std::ffi::OsStr::new("a;b\n\r\t\\\""));
+    assert_eq!(quoted, "\"a;b\\n\\r\\t\\\\\\\"\"");
+}
 
 #[test]
 fn test_parse_worktree_list() {
@@ -55,7 +78,11 @@ fn test_finalize_worktree_with_branch() {
         prunable: None,
     };
 
-    let finalized = finalize_worktree(wt.clone());
+    let test = TestRepo::with_initial_commit();
+    let repo = Repository::at(test.root_path()).unwrap();
+    let mut worktrees = [wt];
+    finalize_worktrees(&repo, &mut worktrees);
+    let [finalized] = worktrees;
     assert_eq!(finalized.branch, Some("feature".to_string()));
 }
 
@@ -72,16 +99,18 @@ fn test_finalize_worktree_detached_with_branch() {
         prunable: None,
     };
 
-    let finalized = finalize_worktree(wt.clone());
+    let test = TestRepo::with_initial_commit();
+    let repo = Repository::at(test.root_path()).unwrap();
+    let mut worktrees = [wt];
+    finalize_worktrees(&repo, &mut worktrees);
+    let [finalized] = worktrees;
     assert_eq!(finalized.branch, Some("feature".to_string()));
 }
 
 #[test]
 fn test_finalize_worktree_detached_no_branch() {
-    // Detached worktree with no branch should attempt rebase detection
-    // Note: This test validates the logic flow but doesn't test actual file reading
-    // since that would require setting up git rebase state files.
-    // Actual rebase detection has been manually verified.
+    // A detached worktree at a nonexistent path fails the git-dir lookup,
+    // so the branch stays empty.
     let wt = WorktreeInfo {
         path: PathBuf::from("/nonexistent/path"),
         head: "abcd1234".to_string(),
@@ -92,10 +121,43 @@ fn test_finalize_worktree_detached_no_branch() {
         prunable: None,
     };
 
-    let finalized = finalize_worktree(wt);
-    // With a nonexistent path, rebase detection should fail gracefully
-    // and branch should remain None
+    let test = TestRepo::with_initial_commit();
+    let repo = Repository::at(test.root_path()).unwrap();
+    let mut worktrees = [wt];
+    finalize_worktrees(&repo, &mut worktrees);
+    let [finalized] = worktrees;
     assert_eq!(finalized.branch, None);
+}
+
+#[test]
+fn test_finalize_worktree_linked_mid_rebase() {
+    // A linked worktree stopped mid-rebase is detached, so `git worktree list`
+    // reports no branch; the branch comes from `rebase-merge/head-name` under
+    // its git dir.
+    let test = TestRepo::with_initial_commit();
+    let linked = test.root_path().parent().unwrap().join("linked-rebase");
+    test.run_git(&["worktree", "add", "-b", "feature", linked.to_str().unwrap()]);
+    std::fs::write(linked.join("feature.txt"), "feature\n").unwrap();
+    test.run_git_in(&linked, &["add", "feature.txt"]);
+    test.run_git_in(&linked, &["commit", "-m", "Feature"]);
+    // `--exec` stops the rebase after replaying the commit, leaving it open.
+    let _ = test
+        .git_command()
+        .current_dir(&linked)
+        .args(["rebase", "--exec", "false", "HEAD~1"])
+        .run();
+
+    let repo = Repository::at(test.root_path()).unwrap();
+    let linked = dunce::canonicalize(&linked).unwrap();
+    let wt = repo
+        .list_worktrees()
+        .unwrap()
+        .iter()
+        .find(|wt| dunce::canonicalize(&wt.path).unwrap() == linked)
+        .unwrap()
+        .clone();
+    assert!(wt.detached, "precondition: the rebase detaches HEAD");
+    assert_eq!(wt.branch.as_deref(), Some("feature"));
 }
 
 #[test]
@@ -272,12 +334,12 @@ use super::ResolvedWorktree;
 
 #[test]
 fn test_resolved_worktree_clone() {
-    let wt = ResolvedWorktree::Worktree {
-        path: PathBuf::from("/path/to/worktree"),
-        branch: Some("feature".to_string()),
-    };
+    let wt = ResolvedWorktree::worktree(
+        PathBuf::from("/path/to/worktree"),
+        Some("feature".to_string()),
+    );
     let cloned = wt.clone();
-    if let ResolvedWorktree::Worktree { path, branch } = cloned {
+    if let ResolvedWorktree::Worktree { path, branch, .. } = cloned {
         assert_eq!(path, PathBuf::from("/path/to/worktree"));
         assert_eq!(branch, Some("feature".to_string()));
     } else {
@@ -288,11 +350,8 @@ fn test_resolved_worktree_clone() {
 #[test]
 fn test_resolved_worktree_none_branch() {
     // Worktree with detached HEAD (no branch)
-    let wt = ResolvedWorktree::Worktree {
-        path: PathBuf::from("/path/to/worktree"),
-        branch: None,
-    };
-    if let ResolvedWorktree::Worktree { path, branch } = wt {
+    let wt = ResolvedWorktree::worktree(PathBuf::from("/path/to/worktree"), None);
+    if let ResolvedWorktree::Worktree { path, branch, .. } = wt {
         assert_eq!(path, PathBuf::from("/path/to/worktree"));
         assert!(branch.is_none());
     } else {
@@ -389,7 +448,8 @@ fn repo_path_error_when_is_bare_fails() {
         discovery_path: PathBuf::from("/nonexistent/repo"),
         git_common_dir: PathBuf::from("/nonexistent/.git"),
         cache: Arc::new(RepoCache::default()),
-        temporary_object_directory: None,
+        worktree_registry_lock: Arc::new(std::sync::RwLock::new(())),
+        temporary_object_store: None,
     };
 
     let err = repo.repo_path().unwrap_err();
@@ -432,7 +492,8 @@ fn repo_path_ignores_non_local_core_worktree() {
         discovery_path: tmp.path().to_path_buf(),
         git_common_dir: git_dir.clone(),
         cache: Arc::new(cache),
-        temporary_object_directory: None,
+        worktree_registry_lock: Arc::new(std::sync::RwLock::new(())),
+        temporary_object_store: None,
     };
 
     // Should fall through to parent(git_common_dir), ignoring the bulk value.
@@ -655,7 +716,8 @@ fn is_builtin_fsmonitor_enabled_variants() {
             discovery_path: PathBuf::from("/nonexistent/repo"),
             git_common_dir: PathBuf::from("/nonexistent/.git"),
             cache: Arc::new(cache),
-            temporary_object_directory: None,
+            worktree_registry_lock: Arc::new(std::sync::RwLock::new(())),
+            temporary_object_store: None,
         }
     }
 
@@ -682,6 +744,84 @@ fn is_builtin_fsmonitor_enabled_variants() {
         );
     }
     assert!(!repo_with_fsmonitor(None).is_builtin_fsmonitor_enabled());
+}
+
+/// A daemon answering on the worktree's IPC socket means no `git
+/// fsmonitor--daemon start` fork; with no socket to reach, the fork runs.
+/// The listener stands in for a running daemon, so no real daemon starts.
+#[cfg(all(unix, feature = "cli"))]
+#[test]
+fn start_fsmonitor_daemon_skips_fork_when_daemon_answers() {
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use crate::git::Repository;
+    use crate::testing::{TestRepo, test_tempdir};
+    use crate::trace::WT_TRACE_TARGET;
+
+    /// Collects the `cmd` of every traced subprocess.
+    struct Commands(Arc<Mutex<Vec<String>>>);
+    struct CmdField(Option<String>);
+    impl Visit for CmdField {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "cmd" {
+                self.0 = Some(value.to_string());
+            }
+        }
+        fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+    }
+    impl<S: tracing::Subscriber> Layer<S> for Commands {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            if event.metadata().target() != WT_TRACE_TARGET {
+                return;
+            }
+            let mut cmd = CmdField(None);
+            event.record(&mut cmd);
+            self.0.lock().unwrap().extend(cmd.0);
+        }
+    }
+    let traced_starts = |start: &dyn Fn()| {
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(Commands(commands.clone()));
+        tracing::subscriber::with_default(subscriber, start);
+        let commands = commands.lock().unwrap();
+        commands
+            .iter()
+            .filter(|cmd| *cmd == "git fsmonitor--daemon start")
+            .count()
+    };
+
+    let test = TestRepo::with_initial_commit();
+    let repo = Repository::at(test.root_path()).unwrap();
+    let socket = repo
+        .worktree_at(test.root_path())
+        .git_dir()
+        .unwrap()
+        .join(super::super::fsmonitor::IPC_SOCKET_NAME);
+    let listener = UnixListener::bind(&socket).unwrap_or_else(|e| {
+        panic!(
+            "bind {} ({} bytes; sun_path holds 103 on macOS): {e}",
+            socket.display(),
+            socket.as_os_str().len()
+        )
+    });
+    listener.set_nonblocking(true).unwrap();
+
+    let starts = traced_starts(&|| repo.start_fsmonitor_daemon_at(test.root_path()));
+    assert_eq!(starts, 0, "a daemon answered, so nothing should fork");
+    listener
+        .accept()
+        .expect("the probe should have connected to the daemon socket");
+
+    // A directory outside any repository has no git dir to probe, so the
+    // start forks (and git exits "not a git repository").
+    let outside = test_tempdir();
+    let starts = traced_starts(&|| repo.start_fsmonitor_daemon_at(outside.path()));
+    assert_eq!(starts, 1, "nothing answered, so the start should fork");
 }
 
 #[test]
@@ -955,6 +1095,46 @@ fn worktree_at_path_resolves_symlinked_path() {
     assert_eq!(branch.as_deref(), Some("feature"));
 }
 
+/// `signs_commits` answers as `git commit` would in the worktree it runs from:
+/// a valueless `gpgsign` is true to git, and a `--worktree` setting applies to
+/// its own worktree only.
+#[test]
+fn signs_commits_follows_gits_reading_per_worktree() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let feature_path = test.add_worktree("feature");
+    let signs = |path: &std::path::Path| Repository::at(path).unwrap().signs_commits().unwrap();
+
+    assert!(!signs(test.root_path()), "unset means unsigned");
+
+    let config_path = test.root_path().join(".git/config");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("[commit]\n\tgpgsign\n");
+    std::fs::write(&config_path, config).unwrap();
+    assert!(signs(test.root_path()), "a valueless key is true");
+
+    test.run_git(&["config", "extensions.worktreeConfig", "true"]);
+    test.run_git_in(
+        &feature_path,
+        &["config", "--worktree", "commit.gpgSign", "false"],
+    );
+    assert!(!signs(&feature_path), "the feature worktree opted out");
+    assert!(signs(test.root_path()), "the opt-out stays in its worktree");
+
+    // A value git can't read as a boolean is an error, not "unsigned" —
+    // `git commit` would refuse the same way.
+    test.run_git(&["config", "commit.gpgSign", "maybe"]);
+    assert!(
+        Repository::at(test.root_path())
+            .unwrap()
+            .signs_commits()
+            .is_err(),
+        "a value that isn't a boolean must surface as an error"
+    );
+}
+
 #[test]
 fn current_worktree_anchors_to_repository_discovery_path() {
     // `Repository::at(p).current_worktree()` must resolve relative to `p`,
@@ -1044,7 +1224,7 @@ fn build_worktree_config_bare_layout() -> (tempfile::TempDir, std::path::PathBuf
             "commit-tree",
             "-m",
             "init",
-            super::integration::EMPTY_TREE_SHA,
+            super::integration::EMPTY_TREE_SHA1,
         ])
         .run()
         .unwrap();
@@ -1336,6 +1516,23 @@ fn prewarm_after_early_repository_still_preloads_config() {
     );
 }
 
+#[test]
+fn repository_instances_share_worktree_registry_coordination() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let linked = test.add_worktree("registry-lock-linked");
+    let first = Repository::at(test.root_path()).unwrap();
+    let second = Repository::at(linked).unwrap();
+
+    let _write = first.worktree_registry_write();
+    assert!(
+        second.worktree_registry_lock.try_read().is_err(),
+        "fresh repository handles for one common directory must share the registry lock"
+    );
+}
+
 /// A worktree answers to its branch and to its own path, and the branch wins.
 ///
 /// Both spellings reaching the same worktree is the point of routing every
@@ -1352,14 +1549,22 @@ fn resolve_worktree_accepts_branch_and_path() {
 
     // A relative path resolves against `-C`, which only a spawned `wt` has —
     // `switch::switch_by_relative_worktree_path` covers that spelling.
+    let mut ids = Vec::new();
     for selector in ["feature", worktree_path.to_str().unwrap()] {
         let resolved = test.repo.resolve_worktree(selector).unwrap();
-        let ResolvedWorktree::Worktree { path, branch } = resolved else {
+        ids.push(
+            resolved
+                .id()
+                .expect("resolved Git item has an identity")
+                .clone(),
+        );
+        let ResolvedWorktree::Worktree { path, branch, .. } = resolved else {
             panic!("{selector} should resolve to a worktree");
         };
         assert_eq!(canonicalize(&path).unwrap(), worktree_path);
         assert_eq!(branch.as_deref(), Some("feature"));
     }
+    assert_eq!(ids[0], ids[1]);
 }
 
 /// A directory whose name matches a branch does not shadow it: `wt switch docs`
@@ -1376,7 +1581,8 @@ fn resolve_worktree_prefers_branch_over_same_named_directory() {
     let nested = test.root_path().join("docs");
     test.add_worktree_at_path("docs-nested", &nested);
 
-    let ResolvedWorktree::Worktree { path, branch } = test.repo.resolve_worktree("docs").unwrap()
+    let ResolvedWorktree::Worktree { path, branch, .. } =
+        test.repo.resolve_worktree("docs").unwrap()
     else {
         panic!("docs should resolve to a worktree");
     };
@@ -1396,7 +1602,7 @@ fn resolve_worktree_reaches_detached_worktree_by_path() {
     let worktree_path = test.add_worktree("feature");
     test.detach_head_in_worktree("feature");
 
-    let ResolvedWorktree::Worktree { path, branch } = test
+    let ResolvedWorktree::Worktree { path, branch, .. } = test
         .repo
         .resolve_worktree(worktree_path.to_str().unwrap())
         .unwrap()
@@ -1433,7 +1639,7 @@ fn resolve_worktree_does_not_treat_shortcuts_as_paths() {
     let resolved = test.repo.resolve_worktree("^").unwrap();
     let branch = match resolved {
         ResolvedWorktree::Worktree { branch, .. } => branch,
-        ResolvedWorktree::BranchOnly { branch } => Some(branch),
+        ResolvedWorktree::BranchOnly { branch, .. } => Some(branch),
         ResolvedWorktree::NoWorktreeAtPath { path } => {
             panic!("`^` resolved to a directory: {}", path.display())
         }
@@ -1451,7 +1657,7 @@ fn resolve_worktree_falls_through_to_branch_only() {
     let test = TestRepo::with_initial_commit();
 
     let resolved = test.repo.resolve_worktree("nowhere").unwrap();
-    let ResolvedWorktree::BranchOnly { branch } = resolved else {
+    let ResolvedWorktree::BranchOnly { branch, .. } = resolved else {
         panic!("an unmatched selector should resolve to branch-only");
     };
     assert_eq!(branch, "nowhere");
@@ -1972,7 +2178,7 @@ fn usable_worktree_for_branch_refuses_a_prunable_registration() {
 
     let err = repo.usable_worktree_for_branch("feature").unwrap_err();
     assert!(
-        err.to_string().contains("Worktree directory missing"),
+        err.to_string().contains("is stale"),
         "a prunable registration must be refused, got: {err}"
     );
     assert_eq!(
@@ -2074,5 +2280,525 @@ fn worktree_is_unusable_covers_locked_absent_and_recreated() {
     assert!(
         repo.worktree_is_unusable(&recreated).unwrap(),
         "a recreated directory exists, so only the `prunable` half catches it"
+    );
+}
+
+/// Unregistering a stale worktree repeats git's own prune test at deletion
+/// time, since the caller's `prunable` came from an earlier listing: an entry
+/// locked or reconnected since is refused and keeps its registration. A stale
+/// entry goes whatever is left at its path — nothing, a directory, or a file —
+/// and a directory that remains keeps its files.
+#[test]
+fn prune_worktree_entry_repeats_git_prune_test() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let live = test.add_worktree("live");
+    let locked = test.add_worktree("locked-absent");
+    let absent = test.add_worktree("absent");
+    let dotgit_gone = test.add_worktree("dotgit-gone");
+    let now_a_file = test.add_worktree("now-a-file");
+
+    test.lock_worktree("locked-absent", Some("removable media"));
+    std::fs::remove_dir_all(&locked).unwrap();
+    std::fs::remove_dir_all(&absent).unwrap();
+    std::fs::remove_file(dotgit_gone.join(".git")).unwrap();
+    std::fs::write(dotgit_gone.join("leftover.txt"), "kept").unwrap();
+    // `now-a-file/.git` fails with `NotADirectory`, which git also counts as
+    // nothing there.
+    std::fs::remove_dir_all(&now_a_file).unwrap();
+    std::fs::write(&now_a_file, "not a directory").unwrap();
+
+    let repo = Repository::at(test.root_path()).unwrap();
+    let registered = || {
+        test.git_output(&["worktree", "list", "--porcelain"])
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .filter_map(|path| PathBuf::from(path).file_name().map(|n| n.to_owned()))
+            .collect::<Vec<_>>()
+    };
+
+    let err = repo.prune_worktree_entry(&live).unwrap_err();
+    assert!(err.to_string().contains("no longer stale"), "got: {err}");
+    let err = repo.prune_worktree_entry(&locked).unwrap_err();
+    assert!(err.to_string().contains("is locked"), "got: {err}");
+
+    repo.prune_worktree_entry(&absent).unwrap();
+    repo.prune_worktree_entry(&dotgit_gone).unwrap();
+    repo.prune_worktree_entry(&now_a_file).unwrap();
+    let names = registered();
+    for (path, kept) in [
+        (&live, true),
+        (&locked, true),
+        (&absent, false),
+        (&dotgit_gone, false),
+        (&now_a_file, false),
+    ] {
+        assert_eq!(
+            names.iter().any(|name| name == path.file_name().unwrap()),
+            kept,
+            "{} registration; worktrees: {names:?}",
+            path.display()
+        );
+    }
+    assert!(dotgit_gone.join("leftover.txt").is_file());
+
+    let err = repo.prune_worktree_entry(&absent).unwrap_err();
+    assert!(
+        err.to_string().contains("No worktree registered"),
+        "got: {err}"
+    );
+}
+
+/// A `.git` that can't be statted is not taken for an absent one: the entry
+/// keeps its registration, and the error names what couldn't be checked.
+#[cfg(unix)]
+#[test]
+fn prune_worktree_entry_keeps_an_entry_it_cannot_check() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let test = TestRepo::with_initial_commit();
+    let guarded = test.root_path().parent().unwrap().join("guarded");
+    std::fs::create_dir(&guarded).unwrap();
+    let worktree_path = guarded.join("wt");
+    test.run_git(&[
+        "worktree",
+        "add",
+        "--detach",
+        worktree_path.to_str().unwrap(),
+    ]);
+    let repo = Repository::at(test.root_path()).unwrap();
+
+    let set_mode =
+        |mode| std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(mode)).unwrap();
+    set_mode(0o000);
+    // Skip if running as root: euid 0 ignores DAC mode bits, so the stat
+    // would succeed. Probe with the stat the mode should refuse.
+    if std::fs::symlink_metadata(worktree_path.join(".git")).is_ok() {
+        set_mode(0o755);
+        crate::styling::eprintln!("Skipping - running with elevated privileges");
+        return;
+    }
+    let result = repo.prune_worktree_entry(&worktree_path);
+    set_mode(0o755);
+
+    let err = result.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("Failed to check"),
+        "got: {err:#}"
+    );
+    assert!(
+        test.git_output(&["worktree", "list", "--porcelain"])
+            .contains("guarded/wt"),
+        "the entry should stay registered"
+    );
+}
+
+/// A stale registration is asked what unregistering it would destroy: its
+/// index against `HEAD`, and git's in-progress state files. A registration
+/// with no index has nothing staged, and on an unborn branch the index is
+/// read against the empty tree, so a staged file counts and an emptied index
+/// doesn't.
+#[test]
+fn stale_worktree_work_reads_the_registration() {
+    use crate::git::{InProgressOperation, Repository, StaleWorktreeWork};
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let clean = test.add_worktree("clean");
+    let staged = test.add_worktree("staged");
+    std::fs::write(staged.join("new.txt"), "work").unwrap();
+    test.run_git_in(&staged, &["add", "new.txt"]);
+    let bisecting = test.add_worktree("bisecting");
+    test.run_git_in(&bisecting, &["bisect", "start"]);
+    let parent = test.root_path().parent().unwrap().to_path_buf();
+    let no_checkout = parent.join("repo.no-checkout");
+    test.run_git(&[
+        "worktree",
+        "add",
+        "--no-checkout",
+        "--detach",
+        no_checkout.to_str().unwrap(),
+    ]);
+    let unborn = parent.join("repo.unborn");
+    test.run_git(&[
+        "worktree",
+        "add",
+        "--orphan",
+        "-b",
+        "fresh",
+        unborn.to_str().unwrap(),
+    ]);
+    std::fs::write(unborn.join("first.txt"), "work").unwrap();
+    test.run_git_in(&unborn, &["add", "first.txt"]);
+    // An unborn branch whose index exists but holds nothing.
+    let unborn_empty = parent.join("repo.unborn-empty");
+    test.run_git(&[
+        "worktree",
+        "add",
+        "--orphan",
+        "-b",
+        "fresh-empty",
+        unborn_empty.to_str().unwrap(),
+    ]);
+    std::fs::write(unborn_empty.join("first.txt"), "work").unwrap();
+    test.run_git_in(&unborn_empty, &["add", "first.txt"]);
+    test.run_git_in(&unborn_empty, &["rm", "--cached", "-q", "first.txt"]);
+    for path in [
+        &clean,
+        &staged,
+        &bisecting,
+        &no_checkout,
+        &unborn,
+        &unborn_empty,
+    ] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    let repo = Repository::at(test.root_path()).unwrap();
+    assert_eq!(repo.stale_worktree_work(&clean).unwrap(), None);
+    assert_eq!(
+        repo.stale_worktree_work(&staged).unwrap(),
+        Some(StaleWorktreeWork::StagedChanges)
+    );
+    assert_eq!(
+        repo.stale_worktree_work(&bisecting).unwrap(),
+        Some(StaleWorktreeWork::Operation(InProgressOperation::Bisect))
+    );
+    assert_eq!(repo.stale_worktree_work(&no_checkout).unwrap(), None);
+    assert_eq!(
+        repo.stale_worktree_work(&unborn).unwrap(),
+        Some(StaleWorktreeWork::StagedChanges)
+    );
+    assert_eq!(repo.stale_worktree_work(&unborn_empty).unwrap(), None);
+}
+
+/// The deletion waits for in-process registry readers: `git worktree list`
+/// reads every entry's files, so one overlapping the deletion could read the
+/// entry half-deleted and fail. A held read guard keeps the entry intact; its
+/// release lets the prune through.
+#[test]
+fn prune_worktree_entry_waits_for_registry_readers() {
+    use std::time::{Duration, Instant};
+
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let worktree_path = test.add_worktree("feature");
+    std::fs::remove_dir_all(&worktree_path).unwrap();
+    let registration = test
+        .root_path()
+        .join(".git/worktrees")
+        .join(worktree_path.file_name().unwrap());
+    assert!(registration.is_dir());
+    let repo = Repository::at(test.root_path()).unwrap();
+    let worker_repo = repo.clone();
+
+    let reader = repo.worktree_registry_read();
+    let worker = std::thread::spawn(move || worker_repo.prune_worktree_entry(&worktree_path));
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while registration.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let survived_reader = registration.exists();
+    drop(reader);
+    let result = worker.join().expect("prune thread should not panic");
+
+    assert!(
+        survived_reader,
+        "the prune ran under a held registry read guard"
+    );
+    result.unwrap();
+    assert!(!registration.exists());
+}
+
+/// The ownership gate accepts a worktree that holds its own registration, in
+/// both shapes: a linked worktree, whose `.git` file names a registration that
+/// names it back, and the main worktree, which has no registration at all
+/// because its git dir *is* the common dir.
+///
+/// The main-worktree arm is a backstop rather than a path a command reaches —
+/// `wt remove` rejects the main worktree well before this gate, and a bare
+/// repository's worktrees are all linked — so nothing through the CLI would
+/// notice it inverting.
+#[test]
+fn ensure_holds_this_worktree_accepts_both_worktree_shapes() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let linked = test.add_worktree("linked");
+    let repo = Repository::at(test.root_path()).unwrap();
+
+    repo.worktree_at(&linked)
+        .ensure_holds_this_worktree()
+        .expect("a linked worktree holding its own registration is accepted");
+    repo.worktree_at(test.root_path())
+        .ensure_holds_this_worktree()
+        .expect("the main worktree is accepted, having no registration to point back at");
+}
+
+/// A directory that has lost its `.git` entry holds no worktree of ours, even
+/// where the tree above it answers for this repository.
+///
+/// The gate reads `<dir>/.git` and stops there, as git's own validation does.
+/// `git rev-parse --git-dir` walks up instead, so from a worktree nested inside
+/// another it resolves to the enclosing repository's git dir — which *is* the
+/// common dir, so a gate resolving that way accepts the directory as the main
+/// worktree.
+///
+/// `wt remove` refuses this state at the upstream `prunable` check, which is why
+/// the gate is the only place it can be asked about directly.
+#[test]
+fn ensure_holds_this_worktree_refuses_a_directory_that_lost_its_git_entry() {
+    use crate::git::Repository;
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let nested_path = test.root_path().join("nested");
+    let nested = test.add_worktree_at_path("nested", &nested_path);
+    std::fs::remove_file(nested.join(".git")).unwrap();
+
+    let repo = Repository::at(test.root_path()).unwrap();
+    assert_eq!(
+        repo.worktree_at(&nested).git_dir().unwrap(),
+        repo.git_common_dir(),
+        "premise: walking up from the emptied directory reaches this repository"
+    );
+    repo.worktree_at(&nested)
+        .ensure_holds_this_worktree()
+        .expect_err("a directory with no `.git` entry holds no worktree of ours");
+}
+
+/// The refusal names where the occupant belongs in a form the user can act on,
+/// including when the registration records it relatively.
+///
+/// A relative `gitdir` entry is resolved against the registration directory, so
+/// the recorded path arrives with a `..` chain through `.git/worktrees/<id>`
+/// still in it, and the directory it names no longer exists — that is why the
+/// gate is refusing. Plain canonicalization can't normalize a path that isn't
+/// there, so the hint would otherwise print the traversal verbatim.
+///
+/// Asserted against `Diagnostic::render`, since the path is in the hint and
+/// `Display` carries only the title.
+#[test]
+fn worktree_path_not_ours_names_a_normalized_path() {
+    use crate::git::{Diagnostic, GitError, Repository};
+    use crate::testing::TestRepo;
+
+    let mut test = TestRepo::with_initial_commit();
+    let occupied = test.add_worktree("occupied");
+    let occupant = test.add_worktree("occupant");
+
+    // Record the occupant's own worktree relatively, as git does under
+    // `worktree.useRelativePaths`, then move it onto the other's path.
+    let registration = PathBuf::from(
+        std::fs::read_to_string(occupant.join(".git"))
+            .unwrap()
+            .trim()
+            .strip_prefix("gitdir: ")
+            .unwrap(),
+    );
+    let relative = PathBuf::from("../../../..")
+        .join(occupant.file_name().unwrap())
+        .join(".git");
+    std::fs::write(
+        registration.join("gitdir"),
+        relative.to_string_lossy().as_ref(),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&occupied).unwrap();
+    std::fs::rename(&occupant, &occupied).unwrap();
+
+    let repo = Repository::at(test.root_path()).unwrap();
+    let refusal = repo
+        .worktree_at(&occupied)
+        .ensure_holds_this_worktree()
+        .expect_err("the occupant's registration records a path it has left")
+        .downcast_ref::<GitError>()
+        .expect("the gate refuses with a GitError")
+        .render();
+
+    assert!(
+        !refusal.contains(".."),
+        "the refusal must name a normalized path:\n{refusal}"
+    );
+    assert!(
+        refusal.contains(&occupant.file_name().unwrap().to_string_lossy().to_string()),
+        "the refusal must name where the occupant belongs:\n{refusal}"
+    );
+}
+
+/// Build a `git init --separate-git-dir` layout: the work tree's `.git` is a
+/// *file* pointing at a store directory outside it. Returns the tempdir, the
+/// store (which is the repository's git common dir) and the work tree.
+///
+/// `git worktree repair` runs last so the store carries git's `gitdir`
+/// backlink. Neither `git init --separate-git-dir` nor `git clone
+/// --separate-git-dir` writes one, so an unrepaired repository of this shape
+/// records its work tree nowhere.
+///
+/// `relative_backlink` sets `worktree.useRelativePaths` before the repair, so
+/// git writes the backlink as a path relative to the store rather than an
+/// absolute one. Git honors the setting from 2.48; below that it keeps writing
+/// the absolute form, which the tests accept the same way
+/// `test_switch_with_relative_worktree_paths` does.
+fn build_separate_git_dir_layout() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    build_separate_git_dir_layout_with(false)
+}
+
+fn build_separate_git_dir_layout_with(
+    relative_backlink: bool,
+) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    use super::canonicalize;
+    use crate::shell_exec::Cmd;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize(tmp.path()).unwrap();
+    let store = root.join("store").join("repo.gitdir");
+    let work_tree = root.join("work");
+    std::fs::create_dir_all(root.join("store")).unwrap();
+
+    let git = || crate::testing::configure_git_env(Cmd::new("git"));
+    let path_str = |p: &std::path::Path| p.to_str().unwrap().to_owned();
+
+    let out = git()
+        .args([
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            &path_str(&store),
+            &path_str(&work_tree),
+        ])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "git init --separate-git-dir failed");
+
+    let out = git()
+        .current_dir(&work_tree)
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "git commit failed");
+
+    if relative_backlink {
+        let out = git()
+            .current_dir(&work_tree)
+            .args(["config", "worktree.useRelativePaths", "true"])
+            .run()
+            .unwrap();
+        assert!(out.status.success(), "git config failed");
+    }
+
+    let out = git()
+        .current_dir(&work_tree)
+        .args(["worktree", "repair"])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "git worktree repair failed");
+
+    (tmp, store, work_tree)
+}
+
+#[test]
+fn repo_path_follows_the_separate_git_dir_backlink() {
+    // Regression test for #4235. With the git dir outside the work tree, the
+    // `parent(git_common_dir)` fallback names the store's *parent* — so
+    // `{{ repo_path }}.{{ branch }}` placed new worktrees beside the store
+    // rather than beside the work tree.
+    use super::{Repository, canonicalize};
+
+    let (_tmp, store, work_tree) = build_separate_git_dir_layout();
+
+    let repo = Repository::at(&work_tree).unwrap();
+    assert_eq!(
+        canonicalize(repo.git_common_dir()).unwrap(),
+        canonicalize(&store).unwrap(),
+        "the store is the git common dir in this layout"
+    );
+    assert_eq!(
+        canonicalize(repo.repo_path().unwrap()).unwrap(),
+        work_tree,
+        "repo_path must name the work tree, not the store's parent"
+    );
+}
+
+#[test]
+fn list_worktrees_names_the_work_tree_of_a_separate_git_dir_repo() {
+    // Companion to the above: `git worktree list` reports the git common dir
+    // as the main worktree entry here, the same shape `list_worktrees`
+    // already corrects for submodules. Pin the corrected path, which is what
+    // `wt list` renders.
+    use super::{Repository, canonicalize};
+
+    let (_tmp, _store, work_tree) = build_separate_git_dir_layout();
+
+    let repo = Repository::at(&work_tree).unwrap();
+    let worktrees = repo.list_worktrees().unwrap();
+    assert_eq!(
+        canonicalize(&worktrees[0].path).unwrap(),
+        work_tree,
+        "the main worktree entry must be the work tree"
+    );
+}
+
+#[test]
+fn repo_path_declines_a_stale_separate_git_dir_backlink() {
+    // The backlink is one-way, so `repo_path` confirms it: a work tree that
+    // has moved away leaves a `gitdir` file naming a path that no longer
+    // points back. Falling through to `parent(git_common_dir)` returns the
+    // pre-#4235 answer rather than a path that doesn't hold this repository.
+    use super::{Repository, canonicalize};
+
+    let (_tmp, store, work_tree) = build_separate_git_dir_layout();
+    let moved = work_tree.with_file_name("moved");
+    std::fs::rename(&work_tree, &moved).unwrap();
+    // Plant an unrelated repository where the work tree used to be, so the
+    // backlink still resolves to a directory and the `.git` entry there is
+    // what rejects it — not the path simply being gone.
+    let out = crate::testing::configure_git_env(crate::shell_exec::Cmd::new("git"))
+        .args(["init", "-b", "main", work_tree.to_str().unwrap()])
+        .run()
+        .unwrap();
+    assert!(out.status.success(), "git init failed");
+
+    let repo = Repository::at(&store).unwrap();
+    assert_eq!(
+        canonicalize(repo.repo_path().unwrap()).unwrap(),
+        canonicalize(store.parent().unwrap()).unwrap(),
+        "a backlink whose work tree no longer points back must not be used"
+    );
+}
+
+#[test]
+fn repo_path_follows_a_relative_separate_git_dir_backlink() {
+    // Under `worktree.useRelativePaths` git writes the backlink relative to
+    // the store — `../../work/.git` — the same form it uses for a linked
+    // worktree's registration, and it resolves it against the directory the
+    // file sits in. Declining that form, or resolving it against the process
+    // cwd, would leave #4235 unfixed for anyone with the setting on.
+    use std::path::Path;
+
+    use super::{Repository, canonicalize};
+
+    let (_tmp, store, work_tree) = build_separate_git_dir_layout_with(true);
+
+    let backlink = std::fs::read_to_string(store.join("gitdir")).unwrap();
+    assert!(
+        backlink.starts_with("../") || Path::new(backlink.trim()).is_absolute(),
+        "expected a relative or (pre-2.48) absolute backlink: {backlink}"
+    );
+
+    let repo = Repository::at(&work_tree).unwrap();
+    assert_eq!(
+        canonicalize(repo.repo_path().unwrap()).unwrap(),
+        work_tree,
+        "a relative backlink must resolve against the store, not the cwd"
     );
 }

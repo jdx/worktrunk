@@ -78,16 +78,6 @@ impl HookLog {
         }
     }
 
-    /// Create a per-branch internal operation log specification.
-    pub fn internal(op: InternalOp) -> Self {
-        Self::Internal(op)
-    }
-
-    /// Create a repo-wide (branch-agnostic) internal operation log specification.
-    pub fn shared(op: InternalOp) -> Self {
-        Self::Shared(op)
-    }
-
     /// Generate the full log path for a branch in the given log directory.
     ///
     /// Builds the nested path under `{log_dir}/{sanitized-branch}/...` for
@@ -491,11 +481,13 @@ fn spawn_detached_exec_windows(
 /// step is best-effort and additive — failures log at debug level and the
 /// `wt remove` operation proceeds regardless.
 ///
-/// It DOES delay process exit — the shell wrapper waits on it. The daemon
-/// reap enumerates fsmonitor daemons machine-wide with one sequential ~50ms
-/// `lsof` per daemon (measured: 115 daemons → ~5.8s of post-output latency;
-/// see the `internal-sweep` / `enumerate-fsmonitor-daemons` trace spans and
-/// benches/CLAUDE.md § Recording `wt remove` / `wt step prune` staging).
+/// It DOES delay process exit — the shell wrapper waits on it. Enumeration is
+/// two spawns, one `pgrep` plus one `lsof` over the whole daemon PID set, flat
+/// in the machine-wide daemon count. Any live daemon then costs a
+/// `git worktree list`, and a classified orphan a `SIGTERM`→`SIGKILL` wait
+/// bounded by `REAP_KILL_DEADLINE` — both flat in the daemon count too (see
+/// the `internal-sweep` / `enumerate-fsmonitor-daemons` trace spans and
+/// benches/AGENTS.md § Recording `wt remove` / `wt step prune` staging).
 ///
 /// Steps:
 ///
@@ -545,7 +537,7 @@ pub fn sweep_stale_trash(repo: &Repository) {
         &repo.wt_dir(),
         &command,
         "",
-        &HookLog::shared(InternalOp::TrashSweep),
+        &HookLog::Shared(InternalOp::TrashSweep),
         None,
     ) {
         tracing::debug!(error = %e, "Failed to spawn stale trash sweep: {e}");
@@ -781,7 +773,7 @@ pub fn build_remove_command(
         Some(branch_name) => {
             let branch_escaped = escape(branch_name.into());
             format!(
-                "{}git worktree remove{} {} && git branch -D {}",
+                "{}git worktree remove{} {} && git branch -D -- {}",
                 prefix, force_flag, worktree_escaped, branch_escaped
             )
         }
@@ -887,18 +879,18 @@ mod tests {
 
         // changed_directory=true: sleep before removal
         assert_snapshot!(build_remove_command(&path, None, false, true), @"sleep 1 && git worktree remove /tmp/test-worktree");
-        assert_snapshot!(build_remove_command(&path, Some("feature-branch"), false, true), @"sleep 1 && git worktree remove /tmp/test-worktree && git branch -D feature-branch");
+        assert_snapshot!(build_remove_command(&path, Some("feature-branch"), false, true), @"sleep 1 && git worktree remove /tmp/test-worktree && git branch -D -- feature-branch");
 
         // changed_directory=false: no sleep
         assert_snapshot!(build_remove_command(&path, None, false, false), @"git worktree remove /tmp/test-worktree");
-        assert_snapshot!(build_remove_command(&path, Some("feature-branch"), false, false), @"git worktree remove /tmp/test-worktree && git branch -D feature-branch");
+        assert_snapshot!(build_remove_command(&path, Some("feature-branch"), false, false), @"git worktree remove /tmp/test-worktree && git branch -D -- feature-branch");
 
         // With force flag
         assert_snapshot!(build_remove_command(&path, None, true, true), @"sleep 1 && git worktree remove --force /tmp/test-worktree");
 
         // Shell escaping for special characters
         let special_path = PathBuf::from("/tmp/test worktree");
-        assert_snapshot!(build_remove_command(&special_path, Some("feature/branch"), false, true), @"sleep 1 && git worktree remove '/tmp/test worktree' && git branch -D feature/branch");
+        assert_snapshot!(build_remove_command(&special_path, Some("feature/branch"), false, true), @"sleep 1 && git worktree remove '/tmp/test worktree' && git branch -D -- feature/branch");
     }
 
     #[test]
@@ -1013,18 +1005,18 @@ mod tests {
 
         // Per-branch internal operation path: {log_dir}/{sanitized-branch}/internal/{op}.log
         assert_snapshot!(
-            HookLog::internal(InternalOp::Remove).path(log_dir, "main").to_slash_lossy(),
+            HookLog::Internal(InternalOp::Remove)
+                .path(log_dir, "main")
+                .to_slash_lossy(),
             @"/repo/.git/wt/logs/main/internal/remove.log"
         );
 
         // Repo-wide (branch-agnostic) internal operation path:
         // {log_dir}/internal-{op}.log — the branch argument is ignored.
         assert_snapshot!(
-            HookLog::shared(InternalOp::TrashSweep).path(log_dir, "anything").to_slash_lossy(),
-            @"/repo/.git/wt/logs/internal-trash-sweep.log"
-        );
-        assert_snapshot!(
-            HookLog::shared(InternalOp::TrashSweep).path(log_dir, "").to_slash_lossy(),
+            HookLog::Shared(InternalOp::TrashSweep)
+                .path(log_dir, "anything")
+                .to_slash_lossy(),
             @"/repo/.git/wt/logs/internal-trash-sweep.log"
         );
     }

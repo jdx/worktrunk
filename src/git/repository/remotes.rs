@@ -130,7 +130,7 @@ impl Repository {
             .effective_remote_urls
             .entry(remote.to_string())
             .or_insert_with(|| {
-                self.run_command(&["remote", "get-url", remote])
+                self.run_command(&["remote", "get-url", "--", remote])
                     .ok()
                     .map(|url| url.trim().to_string())
                     .filter(|url| !url.is_empty())
@@ -425,21 +425,6 @@ impl Repository {
             .ok()
             .flatten()
             .and_then(|config| config.list.url)
-    }
-
-    /// Check if a ref is a remote tracking branch.
-    ///
-    /// Returns true if the ref appears in the remote-branch inventory
-    /// (e.g., `origin/main`). Returns false for local branches, tags, SHAs,
-    /// non-existent refs, and `<remote>/HEAD` symrefs (which the inventory
-    /// excludes).
-    ///
-    /// Resolved from the remote-branch inventory — no subprocess calls once
-    /// it's populated.
-    pub fn is_remote_tracking_branch(&self, ref_name: &str) -> bool {
-        self.remote_branches()
-            .ok()
-            .is_some_and(|branches| branches.iter().any(|r| r.short_name == ref_name))
     }
 
     /// Strip the remote prefix from a remote-tracking branch name.
